@@ -1,0 +1,251 @@
+// basic imports
+const express = require("express");
+const mongoose = require("mongoose");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const cors = require("cors");
+require("dotenv").config();
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// ---------------- DB CONNECTION ----------------
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => {
+    console.log("database connected");
+  })
+  .catch((err) => {
+    console.log("db error", err);
+  });
+
+// ---------------- SCHEMAS ----------------
+
+// user schema
+const userSchema = new mongoose.Schema({
+  name: String,
+  email: String,
+  password: String,
+  role: String, // user or trainer
+  followedTrainers: [
+    {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User"
+    }
+  ]
+});
+
+const User = mongoose.model("User", userSchema);
+
+// plan schema
+const planSchema = new mongoose.Schema({
+  title: String,
+  description: String,
+  price: Number,
+  duration: Number,
+  trainerId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User"
+  }
+});
+
+const Plan = mongoose.model("Plan", planSchema);
+
+// subscription schema
+const subscriptionSchema = new mongoose.Schema({
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User"
+  },
+  planId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Plan"
+  },
+  date: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+const Subscription = mongoose.model("Subscription", subscriptionSchema);
+
+// ---------------- MIDDLEWARE ----------------
+
+// token verification
+const checkAuth = (req, res, next) => {
+  const header = req.headers.authorization;
+
+  if (!header) {
+    return res.status(401).json({ message: "token missing" });
+  }
+
+  try {
+    const token = header.split(" ")[1];
+    const data = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = data;
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: "invalid token" });
+  }
+};
+
+// trainer check
+const onlyTrainer = (req, res, next) => {
+  if (req.user.role !== "trainer") {
+    return res.status(403).json({ message: "only trainer allowed" });
+  }
+  next();
+};
+
+// ---------------- AUTH ----------------
+
+app.post("/api/signup", async (req, res) => {
+  const { name, email, password, role } = req.body;
+
+  const hashed = await bcrypt.hash(password, 10);
+
+  await User.create({
+    name,
+    email,
+    password: hashed,
+    role
+  });
+
+  res.json({ message: "signup done" });
+});
+
+app.post("/api/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  const user = await User.findOne({ email });
+  if (!user) {
+    return res.status(404).json({ message: "user not found" });
+  }
+
+  const ok = await bcrypt.compare(password, user.password);
+  if (!ok) {
+    return res.status(401).json({ message: "wrong password" });
+  }
+
+  const token = jwt.sign(
+    { userId: user._id, role: user.role },
+    process.env.JWT_SECRET
+  );
+
+  res.json({ token });
+});
+
+// ---------------- PLANS ----------------
+
+// create plan
+app.post("/api/plans", checkAuth, onlyTrainer, async (req, res) => {
+  const plan = await Plan.create({
+    title: req.body.title,
+    description: req.body.description,
+    price: req.body.price,
+    duration: req.body.duration,
+    trainerId: req.user.userId
+  });
+
+  res.json(plan);
+});
+
+// edit plan
+app.put("/api/plans/:id", checkAuth, onlyTrainer, async (req, res) => {
+  const updated = await Plan.findOneAndUpdate(
+    { _id: req.params.id, trainerId: req.user.userId },
+    req.body,
+    { new: true }
+  );
+
+  res.json(updated);
+});
+
+// delete plan
+app.delete("/api/plans/:id", checkAuth, onlyTrainer, async (req, res) => {
+  await Plan.findOneAndDelete({
+    _id: req.params.id,
+    trainerId: req.user.userId
+  });
+
+  res.json({ message: "plan removed" });
+});
+
+// view plans
+app.get("/api/plans", checkAuth, async (req, res) => {
+  const plans = await Plan.find().populate("trainerId", "name");
+
+  const subs = await Subscription.find({ userId: req.user.userId });
+  const bought = subs.map((s) => s.planId.toString());
+
+  const output = plans.map((p) => {
+    if (bought.includes(p._id.toString())) {
+      return p;
+    }
+
+    return {
+      _id: p._id,
+      title: p.title,
+      price: p.price,
+      trainer: p.trainerId.name
+    };
+  });
+
+  res.json(output);
+});
+
+// ---------------- SUBSCRIBE ----------------
+
+app.post("/api/subscribe/:planId", checkAuth, async (req, res) => {
+  const already = await Subscription.findOne({
+    userId: req.user.userId,
+    planId: req.params.planId
+  });
+
+  if (already) {
+    return res.json({ message: "already subscribed" });
+  }
+
+  await Subscription.create({
+    userId: req.user.userId,
+    planId: req.params.planId
+  });
+
+  res.json({ message: "subscription successful" });
+});
+
+// ---------------- FOLLOW ----------------
+
+app.post("/api/follow/:trainerId", checkAuth, async (req, res) => {
+  await User.findByIdAndUpdate(req.user.userId, {
+    $addToSet: { followedTrainers: req.params.trainerId }
+  });
+
+  res.json({ message: "followed" });
+});
+
+app.post("/api/unfollow/:trainerId", checkAuth, async (req, res) => {
+  await User.findByIdAndUpdate(req.user.userId, {
+    $pull: { followedTrainers: req.params.trainerId }
+  });
+
+  res.json({ message: "unfollowed" });
+});
+
+// ---------------- FEED ----------------
+
+app.get("/api/feed", checkAuth, async (req, res) => {
+  const user = await User.findById(req.user.userId);
+
+  const plans = await Plan.find({
+    trainerId: { $in: user.followedTrainers }
+  }).populate("trainerId", "name");
+
+  res.json(plans);
+});
+
+// ---------------- START SERVER ----------------
+
+app.listen(5000, () => {
+  console.log("server started on 5000");
+});
